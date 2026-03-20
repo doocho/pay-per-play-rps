@@ -18,7 +18,7 @@ async fn llms_txt() -> impl IntoResponse {
 
 const LLMS_TXT: &str = r#"# Pay-Per-Play RPS
 
-> A provably-fair Rock-Paper-Scissors game with micropayment-gated play using the MPP (Micro Payment Protocol) 402 flow. Players pay per game via on-chain payments; wins earn token rewards. All server choices are committed before payment, enabling post-game fairness verification.
+> A provably-fair Rock-Paper-Scissors game with micropayment-gated play using the MPP (Machine Payments Protocol) 402 flow. Players pay per game via on-chain payments; wins earn token rewards. All server choices are committed before payment, enabling post-game fairness verification.
 
 ## Payment Flow
 
