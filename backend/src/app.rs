@@ -23,6 +23,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .merge(crate::routes::health::router());
 
     Router::new()
+        .merge(crate::routes::llms::router())
         .nest("/api", api)
         .layer(crate::middleware::request_id::layer())
         .layer(
