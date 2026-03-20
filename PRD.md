@@ -85,7 +85,7 @@ into
 - Server fairness via commit-reveal
 - Outcome-based settlement:
   - win -> choice-based reward token
-  - draw -> full refund
+  - draw -> auto-rematch until decisive result (max 10 rounds)
   - lose -> payment captured by service
 - Result receipt
 - Fairness verification page/API
@@ -184,8 +184,8 @@ Each play requires payment via MPP.
   - player receives a token corresponding to the chosen move
   - payment is retained by the service
 - **Draw**
-  - player receives 100% refund
-  - no token reward
+  - triggers automatic rematch — server re-rolls until win or lose (max 10 rounds)
+  - if all 10 rounds draw (extremely rare), payment is captured with no reward
 - **Lose**
   - payment is retained by the service
   - no reward
@@ -194,7 +194,7 @@ Each play requires payment via MPP.
 
 If the user chooses `rock`:
 - wins -> receives `ROCK` token
-- draws -> gets full refund
+- draws -> automatic rematch (up to 10 rounds until decisive result)
 - loses -> payment goes to treasury
 
 ---
@@ -296,10 +296,10 @@ The system must:
 ### 12.4 Settlement
 
 The system must:
-- handle win / draw / lose correctly
+- handle win / lose correctly
+- auto-rematch on draw (re-roll until decisive, max 10 rounds)
 - issue reward on win
-- issue full refund on draw
-- capture payment on loss
+- capture payment on win and lose (and rare exhausted-draw)
 - persist settlement records
 
 ### 12.5 Receipts
@@ -379,12 +379,14 @@ The system should:
    - settlement summary
    - receipt ID
 
-### Draw Path
+### Draw / Auto-Rematch Path
 
 1. user pays
-2. game resolves to draw
-3. settlement creates full refund
-4. receipt shows refunded amount
+2. first round resolves to draw
+3. server automatically re-rolls (new server choice + salt + commit each round)
+4. repeats until win or lose (max 10 rounds)
+5. settlement captures payment, issues reward if final result is win
+6. receipt shows all rounds and the decisive result
 
 ### Retry Path
 
@@ -443,10 +445,13 @@ Behavior:
   "server_choice": "scissors",
   "server_salt": "0x1234",
   "server_commit": "0xabc123",
+  "rounds": [
+    { "round": 1, "server_choice": "rock", "result": "draw" },
+    { "round": 2, "server_choice": "scissors", "result": "win" }
+  ],
   "settlement": {
     "reward_token": "ROCK",
     "reward_amount": 1,
-    "refund_amount": "0",
     "captured_amount": "0.05"
   },
   "receipt_id": "rcpt_123"
@@ -481,7 +486,7 @@ Must include:
 
 * payment summary
 * result
-* refund/capture data
+* capture data
 * reward summary
 
 ---
@@ -804,7 +809,7 @@ The system must consider:
 
 ### Partial Settlement Failure
 
-* if reward/refund/capture step fails, system should remain recoverable
+* if reward/capture step fails, system should remain recoverable
 * game should not resolve multiple times during recovery
 
 ### Fairness Data Exposure

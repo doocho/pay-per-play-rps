@@ -10,7 +10,7 @@
 
 ## 1. System Overview
 
-Pay-per-Play RPS is a paid HTTP endpoint demo built as a rock-paper-scissors game. The system is structured as a Rust backend serving both a JSON API and a web frontend, backed by PostgreSQL for persistence and Redis for caching and idempotency.
+Pay-per-Play RPS is a paid HTTP endpoint demo built as a rock-paper-scissors game. The system is structured as a Rust backend serving both a JSON API and a web frontend, backed by PostgreSQL for persistence and idempotency.
 
 The architecture prioritizes:
 
@@ -48,11 +48,11 @@ The architecture prioritizes:
 │                    │  (SQLx)     │                           │
 │                    └──────┬──────┘                           │
 └───────────────────────────┼─────────────────────────────────┘
-                    ┌───────┴───────┐
-                    ▼               ▼
-             ┌───────────┐   ┌───────────┐
-             │ PostgreSQL │   │   Redis   │
-             └───────────┘   └───────────┘
+                            │
+                            ▼
+                     ┌───────────┐
+                     │ PostgreSQL │
+                     └───────────┘
 ```
 
 ---
@@ -65,8 +65,7 @@ The architecture prioritizes:
 | HTTP Framework | Axum | Async, tower-based, idiomatic Rust |
 | Async Runtime | Tokio | Standard async runtime for Rust |
 | Database ORM | SQLx | Compile-time checked SQL, async Postgres |
-| Primary Store | PostgreSQL | Relational integrity for game/payment/settlement data |
-| Cache / Idempotency | Redis | Fast key-value store for idempotency keys and TTL-based expiry |
+| Primary Store | PostgreSQL | Relational integrity for game/payment/settlement data; also handles idempotency via dedicated table |
 | Serialization | Serde | Standard Rust serialization |
 | HTTP Client | reqwest | For MPP provider communication |
 | Observability | tracing + tracing-subscriber | Structured logging with span context |
@@ -96,8 +95,7 @@ src/
 ├── middleware/
 │   ├── mod.rs
 │   ├── request_id.rs        # Inject X-Request-Id into every request
-│   ├── idempotency.rs       # Idempotency key enforcement
-│   └── auth.rs              # Wallet/session identity extraction
+│   └── idempotency.rs       # Idempotency key enforcement
 │
 ├── domain/
 │   ├── mod.rs
@@ -131,7 +129,7 @@ src/
 - `domain/` depends on `db/`, `types/`
 - `payments/` depends on `db/`, `types/`
 - `db/` depends on `types/`
-- `middleware/` depends on `types/`
+- `middleware/` depends on `db/`, `types/`
 - No circular dependencies allowed
 
 ---
@@ -158,15 +156,19 @@ Client                          Server
   │  (off-band or inline)         │
   │                               │
   │  POST /play {choice, nonce,   │
-  │   payment_proof}              │
+  │   game_id}                    │
+  │  + Authorization: Payment     │
   │──────────────────────────────▶│
   │                               │── idempotency check
-  │                               │── verify payment (MPP adapter)
+  │                               │── parse_authorization(header)
+  │                               │── mpp.verify_credential(&credential)
+  │                               │── extract payer wallet from Receipt
+  │                               │── upsert user, set game.user_id
   │                               │── transition → PAYMENT_AUTHORIZED
   │                               │── transition → PLAY_LOCKED
   │                               │── resolve game (RPS logic)
   │                               │── transition → RESOLVED_*
-  │                               │── settle (reward / refund / capture)
+  │                               │── settle (reward / capture; auto-rematch on draw)
   │                               │── transition → SETTLED
   │                               │── create receipt
   │  200 OK                       │
@@ -183,8 +185,8 @@ Client                          Server
   │                               │
   │  POST /play (retry, same key) │
   │──────────────────────────────▶│
-  │                               │── idempotency key lookup in Redis
-  │                               │── cache hit: return stored response
+  │                               │── idempotency key lookup in DB
+  │                               │── hit: return stored response
   │  200 OK (cached)              │
   │◀──────────────────────────────│
 ```
@@ -309,6 +311,10 @@ pub fn resolve(user: &Choice, server: &Choice) -> Outcome {
 }
 ```
 
+#### Auto-Rematch on Draw
+
+When a single round resolves to `Draw`, the server automatically re-rolls with a new `server_choice`, `server_salt`, and `server_commit`. This repeats until the outcome is `Win` or `Lose`, up to a maximum of 10 rounds. Each round's fairness data is preserved for verification. If all 10 rounds draw (probability ≈ 0.002%), the game is settled as a draw: payment is captured with no reward.
+
 ### 7.2 Fairness — Commit-Reveal
 
 **Commit phase** (before 402 response):
@@ -340,7 +346,7 @@ Settlement is an orchestration step that executes exactly one of three paths:
 | Outcome | Action |
 |---|---|
 | Win | Capture payment + issue reward token to inventory |
-| Draw | Full refund via MPP |
+| Draw | Auto-rematch: re-roll until win or lose (max 10 rounds). If exhausted, capture payment, no reward |
 | Lose | Capture payment, no reward |
 
 Settlement is wrapped in a database transaction. If any step fails, the entire settlement rolls back and the game remains in `RESOLVED_*` state for retry.
@@ -366,8 +372,8 @@ impl SettlementPlan {
             },
             Outcome::Draw => Self {
                 outcome: Outcome::Draw,
-                captured_amount: Decimal::ZERO,
-                refund_amount: price,
+                captured_amount: price,
+                refund_amount: Decimal::ZERO,
                 reward_token: None,
                 reward_amount: 0,
             },
@@ -399,37 +405,39 @@ Inventory updates happen inside the settlement transaction via `INSERT ... ON CO
 
 ## 8. Payment Integration (MPP)
 
-### 8.1 Adapter Trait
+### 8.1 MPP SDK (`mpp` crate)
 
-The MPP integration is hidden behind a trait to keep domain logic decoupled:
+The payment layer uses the `mpp` Rust SDK directly. No custom adapter trait is needed — the SDK provides the right abstraction.
 
 ```rust
-#[async_trait]
-pub trait PaymentProvider: Send + Sync {
-    async fn create_payment_requirement(
-        &self,
-        game_id: &str,
-        amount: Decimal,
-        currency: &str,
-    ) -> Result<PaymentRequirement>;
+use mpp::server::{Mpp, tempo, TempoConfig};
+use mpp::{parse_authorization, format_www_authenticate};
 
-    async fn verify_payment(
-        &self,
-        proof: &PaymentProof,
-    ) -> Result<PaymentVerification>;
+// Setup (once at startup, stored in AppState as Arc<Mpp>)
+let mpp = Mpp::create(tempo(TempoConfig {
+    recipient: "0x...",
+}))?;
 
-    async fn capture_payment(
-        &self,
-        payment_id: &str,
-    ) -> Result<CaptureResult>;
+// 402 path: generate a payment challenge
+let challenge = mpp.charge("0.05")?;
+let header = format_www_authenticate(&challenge)?;
+// → return 402 + WWW-Authenticate header
 
-    async fn refund_payment(
-        &self,
-        payment_id: &str,
-        amount: Decimal,
-    ) -> Result<RefundResult>;
-}
+// 200 path: verify credential from Authorization header
+let credential = parse_authorization(auth_header)?;
+let receipt = mpp.verify_credential(&credential).await?;
+// receipt.reference → transaction reference
+// payer wallet address extracted from the verified receipt
 ```
+
+Key SDK types:
+
+| Type | Role |
+|---|---|
+| `Mpp` | Server instance binding method, realm, and secret |
+| `Challenge` | Payment requirement returned to client |
+| `Credential` | Payment proof submitted by client |
+| `Receipt` | Verification result with payer info and reference |
 
 ### 8.2 Payment Flow within HTTP
 
@@ -527,7 +535,7 @@ The 402 response follows MPP conventions:
 
 ### 9.2 Key Constraints
 
-- `games.user_id` → `users.id` (FK)
+- `games.user_id` → `users.id` (FK, **NULLABLE** — set when payment is verified and payer wallet is known)
 - `payments.game_id` → `games.id` (FK, UNIQUE)
 - `settlements.game_id` → `games.id` (FK, UNIQUE)
 - `inventories` has a UNIQUE constraint on `(user_id, token_type)`
@@ -553,24 +561,35 @@ The 402 response follows MPP conventions:
 
 | Method | Path | Auth | Description |
 |---|---|---|---|
-| POST | `/api/play` | Wallet | Submit play, receive 402 or result |
-| GET | `/api/games/:game_id` | Wallet | Retrieve game detail |
-| GET | `/api/receipts/:receipt_id` | Wallet | Retrieve settlement receipt |
+| POST | `/api/play` | MPP (Authorization header) | Submit play, receive 402 or result |
+| GET | `/api/games/:game_id` | Public (UUID unguessable) | Retrieve game detail |
+| GET | `/api/receipts/:receipt_id` | Public (UUID unguessable) | Retrieve settlement receipt |
 | GET | `/api/fairness/:game_id` | Public | Verify commit-reveal proof |
 | GET | `/api/leaderboard` | Public | Top players and stats |
-| GET | `/api/inventory` | Wallet | Current user's token balances |
+| GET | `/api/inventory/:wallet_address` | Public | Token balances for a given wallet |
 | GET | `/api/health` | Public | Liveness check |
 
-### 10.2 Common Headers
+### 10.2 Authentication Model
+
+User identity is derived from the MPP payment credential, not from a custom header.
+
+- **POST /api/play (402 path)**: No identity needed. Game is created without `user_id`.
+- **POST /api/play (200 path)**: The `Authorization: Payment ...` header contains a cryptographically signed credential. After `mpp.verify_credential()`, the server extracts the payer's wallet address from the verified `Receipt` and upserts the user.
+- **Read endpoints**: All public. Game/receipt IDs are UUIDs (unguessable). Inventory uses wallet address as a path parameter.
+
+This eliminates the need for a separate auth middleware in MVP.
+
+### 10.3 Common Headers
 
 | Header | Direction | Purpose |
 |---|---|---|
 | `X-Request-Id` | Both | Request tracing |
 | `X-Idempotency-Key` | Request | Idempotent retry support |
-| `X-MPP-Payment-Proof` | Request | Payment authorization/proof |
-| `X-Wallet-Address` | Request | User identity (MVP simplified auth) |
+| `Authorization` | Request | `Payment` scheme credential (MPP standard) |
+| `WWW-Authenticate` | Response | `Payment` scheme challenge (on 402) |
+| `Payment-Receipt` | Response | MPP receipt reference (on 200 after payment) |
 
-### 10.3 Error Response Format
+### 10.4 Error Response Format
 
 All errors follow a consistent envelope:
 
@@ -610,24 +629,25 @@ Request
 ├───────────────────────┤
 │  2. Tracing           │  Create tracing span with request_id
 ├───────────────────────┤
-│  3. Auth              │  Extract wallet identity from header
+│  3. Idempotency       │  Check DB for cached response
 ├───────────────────────┤
-│  4. Idempotency       │  Check Redis for cached response
-├───────────────────────┤
-│  5. Route Handler     │  Business logic
+│  4. Route Handler     │  Business logic (MPP auth handled per-route)
 └───────────────────────┘
   │
   ▼
 Response
 ```
 
+Note: There is no global auth middleware. User identity is extracted from the MPP credential inside the `/api/play` handler only. All other endpoints are public.
+
 ### Idempotency Middleware Detail
 
 - Key: value of `X-Idempotency-Key` header
-- Scope: per wallet address
-- Storage: Redis with TTL (e.g., 24 hours)
-- On cache hit: return stored response directly, skip handler
-- On cache miss: execute handler, store response in Redis before returning
+- Scope: per game_id (derived from request body)
+- Storage: `idempotency` table in PostgreSQL with `expires_at` column
+- On hit: return stored response directly, skip handler
+- On miss: execute handler, store response in `idempotency` table before returning
+- Cleanup: background job periodically deletes rows where `expires_at < NOW()`
 
 ---
 
@@ -636,8 +656,7 @@ Response
 ```rust
 pub struct AppState {
     pub db: PgPool,
-    pub redis: RedisPool,
-    pub payment_provider: Arc<dyn PaymentProvider>,
+    pub mpp: Arc<Mpp>,
     pub config: AppConfig,
 }
 
@@ -655,27 +674,58 @@ pub struct AppConfig {
 
 ## 13. Security
 
-### 13.1 Replay Prevention
+### 13.1 Identity via MPP Credential (No Custom Auth)
 
-- Each `provider_payment_id` has a UNIQUE constraint — the same payment proof cannot be used for two games
-- Idempotency keys are scoped per wallet to prevent cross-user replay
+User identity is not established by a custom header. Instead, it is derived from the cryptographically verified MPP payment credential:
 
-### 13.2 Fairness Data Protection
+- The `Authorization: Payment` header contains a credential signed by the payer's private key
+- `mpp.verify_credential()` validates the credential against the Tempo blockchain and returns a `Receipt` containing the payer's wallet address
+- The server upserts the user record based on this verified address
+
+This prevents impersonation attacks: an attacker cannot forge a credential without the victim's private key, even if they observe the on-chain payment.
+
+### 13.2 MPP Challenge Binding
+
+Each payment is bound to a specific server-issued challenge:
+
+- The challenge ID is delivered only to the requesting client over TLS
+- The credential must reference the exact challenge ID issued by the server
+- The server validates challenge authenticity via HMAC (`MPP_SECRET_KEY`)
+- Each challenge and payment proof is single-use — replay is rejected by the protocol
+
+This means: even if attacker B sees user A's on-chain payment, B cannot construct a valid credential because B does not possess the challenge ID (delivered to A over HTTPS) nor can B forge A's cryptographic signature.
+
+### 13.3 Replay Prevention
+
+- MPP protocol enforces single-use payment proofs at the protocol level
+- Each `provider_payment_id` has a UNIQUE constraint in the DB as a second layer of defense
+- Idempotency keys are scoped per game_id
+
+### 13.4 Fairness Data Protection
 
 - `server_choice` and `server_salt` are never returned in any response until the game reaches `PLAY_LOCKED` or later
 - The 402 response only includes `server_commit` (the hash)
 
-### 13.3 Settlement Integrity
+### 13.5 Settlement Integrity
 
 - Settlement executes in a single database transaction
 - The `settlements.game_id` UNIQUE constraint prevents double settlement at the DB level
 - Application-level state machine check provides a second layer of defense
 
-### 13.4 Input Validation
+### 13.6 Read Endpoint Exposure
+
+All read endpoints are public in MVP. This is acceptable because:
+
+- Game and receipt IDs are UUIDv4 (unguessable, 122 bits of entropy)
+- Inventory data (token balances) is not sensitive — similar to on-chain data visibility
+- Leaderboard is intentionally public
+- No financial actions can be triggered through read endpoints
+
+### 13.7 Input Validation
 
 - `choice` must be one of `rock`, `paper`, `scissors` — validated at deserialization
 - All IDs are validated for format before DB lookup
-- Payment proof payloads are validated by the MPP adapter before any state transition
+- Payment credentials are validated by the MPP SDK before any state transition
 
 ---
 
@@ -715,7 +765,6 @@ async fn handle_play(state: AppState, req: PlayRequest) -> Result<impl IntoRespo
 {
   "status": "ok",
   "db": "connected",
-  "redis": "connected",
   "version": "0.1.0"
 }
 ```
@@ -810,37 +859,53 @@ WHERE status IN ('resolved_win', 'resolved_draw', 'resolved_lose')
 
 Each retry re-enters the settlement flow, which is idempotent by design.
 
+### 17.3 Idempotency Key Cleanup
+
+A background Tokio task runs periodically (e.g., every 5 minutes) to remove expired idempotency records:
+
+```sql
+DELETE FROM idempotency
+WHERE expires_at < NOW();
+```
+
 ---
 
 ## 18. Infrastructure
 
-### 18.1 MVP Deployment
+### 18.1 Railway Deployment
+
+Both MVP and production use Railway as the single platform:
 
 ```
-┌────────────────────────────────────────────┐
-│              Docker Compose                │
-│                                            │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐ │
-│  │  Rust    │  │ Postgres │  │  Redis   │ │
-│  │  Backend │  │          │  │          │ │
-│  │  :8080   │  │  :5432   │  │  :6379   │ │
-│  └──────────┘  └──────────┘  └──────────┘ │
-│                                            │
-│  ┌──────────┐                              │
-│  │ Frontend │                              │
-│  │ (Next.js)│                              │
-│  │  :3000   │                              │
-│  └──────────┘                              │
-└────────────────────────────────────────────┘
+┌───────────────────────────────────────┐
+│              Railway                  │
+│                                       │
+│  ┌──────────┐    ┌──────────────┐     │
+│  │  Rust    │───▶│  Managed     │     │
+│  │  Backend │    │  PostgreSQL  │     │
+│  │  (Nixpacks)   │              │     │
+│  └──────────┘    └──────────────┘     │
+│                                       │
+│  Private networking between services  │
+│  TLS termination at edge              │
+│  Auto-deploy from GitHub              │
+└───────────────────────────────────────┘
 ```
 
-### 18.2 Production Target (v2)
+Frontend (Next.js) will be deployed separately (Vercel or Railway) in a later phase.
 
-- Container orchestration via Fly.io or Railway
-- Managed Postgres (Neon or Supabase)
-- Managed Redis (Upstash)
-- Frontend on Vercel
-- TLS termination at edge
+### 18.2 Local Development
+
+No Docker or docker-compose needed. Run the backend directly with `cargo run` and connect to Railway's managed Postgres:
+
+```bash
+# Option A: Direct
+DATABASE_URL=postgres://... cargo run
+
+# Option B: Railway CLI (injects env vars automatically)
+railway link
+railway run cargo run
+```
 
 ### 18.3 Configuration
 
@@ -849,12 +914,12 @@ All configuration is environment-variable driven:
 | Variable | Description | Default |
 |---|---|---|
 | `DATABASE_URL` | Postgres connection string | — |
-| `REDIS_URL` | Redis connection string | — |
 | `PLAY_PRICE` | Price per game | `0.05` |
 | `PLAY_CURRENCY` | Currency code | `USD` |
 | `GAME_TTL_SECONDS` | Unpaid game expiration | `300` |
-| `MPP_PROVIDER_URL` | MPP service endpoint | — |
-| `MPP_API_KEY` | MPP authentication | — |
+| `MPP_SECRET_KEY` | HMAC secret for stateless challenge verification | — |
+| `MPP_RECIPIENT` | Tempo wallet address to receive payments | — |
+| `MPP_RPC_URL` | Tempo RPC endpoint | `https://rpc.tempo.xyz` |
 | `RUST_LOG` | Tracing filter directive | `info` |
 | `PORT` | HTTP listen port | `8080` |
 
@@ -886,9 +951,10 @@ All configuration is environment-variable driven:
 
 ### 19.3 Test Infrastructure
 
-- Use `sqlx::test` with a test database for DB integration tests
-- Mock `PaymentProvider` trait for payment tests
-- Redis test instance (or mock) for idempotency tests
+- Use `sqlx::test` with a test database for DB integration tests (Railway test DB or local Postgres)
+- **Unit tests**: Test domain logic only (game resolution, fairness, settlement) — no MPP dependency needed
+- **Integration tests**: Use Tempo testnet (moderato) with test tokens for real payment flow verification
+- Idempotency tests run against the same test database
 
 ---
 
@@ -904,7 +970,7 @@ All configuration is environment-variable driven:
 
 ### M2 — Payment + Resolution
 
-- [ ] MPP adapter trait + mock implementation
+- [ ] MPP SDK integration (`mpp` crate with `server` + `tempo` features)
 - [ ] Payment verification flow
 - [ ] Game resolution logic
 - [ ] Settlement orchestration
@@ -916,12 +982,12 @@ All configuration is environment-variable driven:
 - [ ] `GET /api/receipts/:receipt_id`
 - [ ] `GET /api/fairness/:game_id`
 - [ ] `GET /api/leaderboard`
-- [ ] `GET /api/inventory`
+- [ ] `GET /api/inventory/:wallet_address`
 
 ### M4 — Middleware + Hardening
 
 - [ ] Request ID middleware
-- [ ] Idempotency middleware (Redis)
+- [ ] Idempotency middleware (Postgres)
 - [ ] Game expiration background job
 - [ ] Settlement retry background job
 - [ ] Structured tracing
@@ -932,7 +998,7 @@ All configuration is environment-variable driven:
 - [ ] Play screen with 402 flow
 - [ ] Result display with fairness proof
 - [ ] Inventory and leaderboard pages
-- [ ] Docker Compose for local dev
+- [ ] Railway deployment configuration
 
 ---
 
@@ -942,8 +1008,8 @@ All configuration is environment-variable driven:
 |---|---|---|
 | Single endpoint for play | `POST /api/play` handles both 402 and resolution | Matches HTTP-native payment negotiation model; client retries same endpoint after paying |
 | State machine in DB | Postgres enum column with application-level transition validation | Simple, auditable, crash-recoverable |
-| MPP behind trait | `PaymentProvider` trait with concrete MPP impl | Testability; future provider swaps; domain isolation |
-| Idempotency in Redis | Redis key with TTL | Fast lookups; automatic expiry; no DB bloat |
+| MPP SDK direct | Use `mpp` crate's `Mpp` struct directly via `Arc<Mpp>` in AppState | SDK already provides the right abstraction; identity derived from verified credential |
+| Idempotency in Postgres | `idempotency` table with `expires_at` + periodic cleanup | Single data store; no extra infra; sufficient for MVP throughput |
 | Settlement in single TX | All settlement writes in one Postgres transaction | Atomicity guarantees exactly-once semantics |
 | SHA-256 for commit | `SHA256(game_id \|\| choice \|\| salt)` | Widely understood, easy to verify client-side |
 | Reward as DB inventory | Not on-chain for MVP | Simplicity; on-chain migration planned for v2 |
@@ -955,8 +1021,9 @@ All configuration is environment-variable driven:
 
 | # | Question | Impact |
 |---|---|---|
-| 1 | What is the exact MPP Rust SDK interface? | Determines adapter implementation |
-| 2 | Should the 402 response use standard MPP headers or JSON body? | API design |
-| 3 | How is user identity established — wallet signature or session? | Auth middleware |
+| 1 | ~~What is the exact MPP Rust SDK interface?~~ **Resolved**: `mpp` crate v0.5.0 from `tempoxyz/mpp-rs` | — |
+| 2 | ~~Should the 402 response use standard MPP headers or JSON body?~~ **Resolved**: Standard `WWW-Authenticate: Payment` header per MPP spec | — |
+| 3 | ~~How is user identity established?~~ **Resolved**: Derived from MPP credential's verified Receipt (payer wallet address) | — |
 | 4 | Should receipts be signed by the server for external verifiability? | Receipt trustworthiness |
-| 5 | What is the target deployment platform for MVP? | Infrastructure setup |
+| 5 | ~~What is the target deployment platform for MVP?~~ **Resolved**: Railway (backend + managed Postgres) | — |
+| 6 | Does `mpp.verify_credential()` return the payer's wallet address directly, or does it need to be extracted from the on-chain transaction? | User identification implementation detail |
