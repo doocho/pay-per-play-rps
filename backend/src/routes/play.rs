@@ -11,7 +11,7 @@ use serde_json::json;
 
 use crate::app::AppState;
 use crate::db;
-use crate::domain::{fairness, game, settlement};
+use crate::domain::{fairness, game, payer, settlement};
 use crate::error::AppError;
 use crate::types::api::{PlayRequest, PlayResultResponse, RoundSummary, SettlementSummary};
 use crate::types::domain::{GameStatus, Outcome};
@@ -102,7 +102,9 @@ async fn handle_paid_play(
         .await
         .map_err(|e| AppError::PaymentInvalid(format!("payment verification failed: {e}")))?;
 
-    let payer_wallet = receipt.reference.clone();
+    let payer_wallet =
+        payer::resolve_payer_wallet(auth_header, &receipt.reference, &state.tempo_provider)
+            .await?;
     let user = db::users::upsert_by_wallet(&state.db, &payer_wallet).await?;
 
     let mut tx = state.db.begin().await?;

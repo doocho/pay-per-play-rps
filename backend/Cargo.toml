@@ -36,6 +36,14 @@ mpp = { git = "https://github.com/tempoxyz/mpp-rs", features = [
     "axum",
 ] }
 
+# Same major as mpp — RPC fallback, tx hash parsing, and `SignerRecoverable::recover_signer`.
+alloy = { version = "1.7", default-features = false, features = [
+    "std",
+    "provider-http",
+    "consensus-secp256k1",
+] }
+tempo-primitives = { git = "https://github.com/tempoxyz/tempo" }
+
 [patch.crates-io]
 tempo-alloy = { git = "https://github.com/tempoxyz/tempo" }
 tempo-primitives = { git = "https://github.com/tempoxyz/tempo" }

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use mpp::server::{tempo, Mpp, TempoConfig};
+use mpp::server::{tempo, tempo_provider, Mpp, TempoConfig};
 use sqlx::postgres::PgPoolOptions;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -43,9 +43,12 @@ async fn main() -> anyhow::Result<()> {
         .rpc_url(&config.mpp_rpc_url),
     )?;
 
+    let tempo_provider = tempo_provider(&config.mpp_rpc_url)?;
+
     let state = Arc::new(app::AppState {
         db: db.clone(),
         mpp: Arc::new(mpp) as Arc<dyn mpp::server::axum::ChargeChallenger>,
+        tempo_provider,
         config: config.clone(),
     });
 

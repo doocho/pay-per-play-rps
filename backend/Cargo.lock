@@ -3414,6 +3414,7 @@ checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 name = "pay-per-play-rps"
 version = "0.1.0"
 dependencies = [
+ "alloy",
  "anyhow",
  "axum",
  "chrono",
@@ -3426,6 +3427,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "sqlx",
+ "tempo-primitives",
  "thiserror",
  "tokio",
  "tower",

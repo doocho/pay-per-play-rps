@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use mpp::server::axum::ChargeChallenger;
+use mpp::server::TempoProvider;
 use sqlx::PgPool;
 
 use crate::config::AppConfig;
@@ -9,6 +10,8 @@ use crate::config::AppConfig;
 pub struct AppState {
     pub db: PgPool,
     pub mpp: Arc<dyn ChargeChallenger>,
+    /// Same RPC as MPP — used to map payment `Receipt.reference` (tx hash) → payer address.
+    pub tempo_provider: TempoProvider,
     pub config: AppConfig,
 }
 
