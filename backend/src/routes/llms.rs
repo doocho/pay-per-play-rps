@@ -18,23 +18,65 @@ async fn llms_txt() -> impl IntoResponse {
 
 const LLMS_TXT: &str = r#"# Pay-Per-Play RPS
 
-> A provably-fair Rock-Paper-Scissors game with micropayment-gated play using the MPP (Machine Payments Protocol) 402 flow. Players pay per game via on-chain payments; wins earn token rewards. All server choices are committed before payment, enabling post-game fairness verification.
+> A provably-fair Rock-Paper-Scissors game with micropayment-gated play using the MPP (Machine Payments Protocol) 402 flow. Players pay per game via on-chain payments; wins earn token rewards. Supports PvE (player vs server) and PvP (player vs player) modes.
+
+## Getting Started with Tempo Wallet CLI
+
+All payments use the Tempo network via the `tempo` CLI. Install and set up your wallet before playing:
+
+```bash
+# Install Tempo CLI
+npm install -g @tempoxyz/cli
+
+# Create or import a wallet
+tempo wallet create
+# or
+tempo wallet import <private-key>
+
+# Check your balance
+tempo wallet balance
+
+# Make a payment (used automatically by the 402 flow)
+tempo request <method> <url> [--body '<json>']
+```
+
+The `tempo request` command handles the full MPP 402 flow automatically:
+1. Sends the initial request → receives 402 + WWW-Authenticate challenge
+2. Signs and submits the on-chain payment
+3. Retries the request with the Authorization header containing the payment receipt
 
 ## Payment Flow
 
 The game uses HTTP 402 Payment Required:
 
 1. POST /api/play without Authorization header → 402 response with WWW-Authenticate challenge and server_commit
-2. Client pays the challenged amount and obtains a payment receipt
+2. Client pays the challenged amount using `tempo request` or any MPP-compatible wallet
 3. POST /api/play again with Authorization: <receipt> header → game resolves, result returned
 
 ## Endpoints
+
+### PvE (Player vs Server)
 
 - [Play a game](POST /api/play): Submit rock/paper/scissors choice. Returns 402 challenge (no auth) or game result (with auth).
 - [Get game details](GET /api/games/{game_id}): Retrieve game state; server choice revealed after resolution.
 - [Verify fairness](GET /api/fairness/{game_id}): Verify commit-reveal integrity for all rounds after game resolves.
 - [Get receipt](GET /api/receipts/{receipt_id}): Retrieve settlement details including refund and reward amounts.
-- [Leaderboard](GET /api/leaderboard): Top 50 players by wins.
+
+### PvP (Player vs Player)
+
+- [Create room](POST /api/pvp/create): Create a PvP room (402 flow). Returns game_id + room_code.
+- [Join room](POST /api/pvp/join/{room_code}): Join a PvP room (402 flow). Returns game_id.
+- [Enter queue](POST /api/pvp/queue): Enter matchmaking queue (402 flow). Returns game_id + matched status.
+- [Leave queue](DELETE /api/pvp/queue): Leave matchmaking queue. Requires Authorization header.
+- [Pay for game](POST /api/pvp/pay/{game_id}): Pay for game (402 flow, separate payment step).
+- [Submit commit](POST /api/pvp/commit/{game_id}): Submit choice commit hash. Requires Authorization.
+- [Reveal choice](POST /api/pvp/reveal/{game_id}): Reveal choice + salt. Requires Authorization.
+- [Poll game](GET /api/pvp/game/{game_id}): Poll game state. Optional Authorization for player perspective.
+- [Verify PvP fairness](GET /api/pvp/fairness/{game_id}): Verify both players' commit-reveal integrity.
+
+### Shared
+
+- [Leaderboard](GET /api/leaderboard): Top 50 players by wins (PvE + PvP combined).
 - [Inventory](GET /api/inventory/{wallet_address}): Token balances earned from wins.
 - [Health](GET /api/health): Service health and DB status.
 
@@ -184,6 +226,8 @@ Returns top 50 wallets ordered by wins desc.
 
 ## Fairness Model
 
+### PvE Fairness
+
 Before accepting payment, the server commits to its choice via:
 
 ```
@@ -191,6 +235,16 @@ commit = SHA-256(game_id || ":" || server_choice || ":" || server_salt)
 ```
 
 The commit is returned in the 402 response body. After the game resolves, the salt and choice are revealed so anyone can recompute and verify the commit via GET /api/fairness/{game_id}.
+
+### PvP Fairness
+
+In PvP, both players generate their own salt and compute their commit hash client-side:
+
+```
+commit = SHA-256(game_id || ":" || choice || ":" || salt)
+```
+
+Both commits must be submitted before either player can reveal. After both reveals, the server verifies each commit and resolves the game. Verify via GET /api/pvp/fairness/{game_id}.
 
 ## PvP (Player vs Player) Mode
 
@@ -204,17 +258,171 @@ PvP mode allows two agents/players to compete against each other. Both players p
 4. **Poll**: Players can poll game state via GET /api/pvp/game/{game_id} at any time.
 5. **Draw**: On draw, the game resets to the commit phase for a rematch round (up to 10 rounds).
 
-### PvP Endpoints
+### PvP Quick Start with Tempo CLI
 
-- POST /api/pvp/create — Create a room (402 flow). Returns game_id + room_code.
-- POST /api/pvp/join/{room_code} — Join a room (402 flow). Returns game_id.
-- POST /api/pvp/queue — Enter matchmaking queue (402 flow). Returns game_id + matched status.
-- DELETE /api/pvp/queue — Leave matchmaking queue. Requires Authorization header.
-- POST /api/pvp/pay/{game_id} — Pay for game (402 flow, for separate payment step).
-- POST /api/pvp/commit/{game_id} — Submit choice commit hash. Body: `{ "commit": "<sha256 hex>" }`. Requires Authorization.
-- POST /api/pvp/reveal/{game_id} — Reveal choice + salt. Body: `{ "choice": "rock", "salt": "<hex>" }`. Requires Authorization.
-- GET /api/pvp/game/{game_id} — Poll game state. Optional Authorization to see your player perspective.
-- GET /api/pvp/fairness/{game_id} — Verify both players' commit-reveal integrity.
+```bash
+# Player A: Create a room
+tempo request POST https://<host>/api/pvp/create
+# → Returns: { "game_id": "<uuid>", "room_code": "ABC123" }
+
+# Player B: Join the room
+tempo request POST https://<host>/api/pvp/join/ABC123
+# → Returns: { "game_id": "<uuid>", "status": "both_paid" }
+
+# Both players: Compute commit and submit
+# commit = SHA-256(game_id + ":" + choice + ":" + salt)
+tempo request POST https://<host>/api/pvp/commit/<game_id> --body '{ "commit": "<sha256 hex>" }'
+
+# Both players: Reveal choice and salt
+tempo request POST https://<host>/api/pvp/reveal/<game_id> --body '{ "choice": "rock", "salt": "<hex>" }'
+
+# Poll game state at any time
+curl https://<host>/api/pvp/game/<game_id>
+```
+
+### POST /api/pvp/create
+
+Creates a PvP room. Uses 402 flow — first call returns payment challenge, second call (with Authorization) creates the room.
+
+**With Authorization** — returns HTTP 200:
+```json
+{
+  "game_id": "<uuid>",
+  "room_code": "ABC123",
+  "status": "waiting_for_opponent"
+}
+```
+
+### POST /api/pvp/join/{room_code}
+
+Joins an existing PvP room by room code. Uses 402 flow.
+
+**With Authorization** — returns HTTP 200:
+```json
+{
+  "game_id": "<uuid>",
+  "status": "both_paid"
+}
+```
+
+### POST /api/pvp/queue
+
+Enters the matchmaking queue. Uses 402 flow. If a match is found, both players are paired immediately.
+
+**With Authorization** — returns HTTP 200:
+```json
+{
+  "game_id": "<uuid>",
+  "status": "waiting_for_opponent" | "both_paid",
+  "matched": true | false
+}
+```
+
+### DELETE /api/pvp/queue
+
+Leaves the matchmaking queue. Requires Authorization header.
+
+### POST /api/pvp/pay/{game_id}
+
+Separate payment step for room creators who need to pay after creation. Uses 402 flow.
+
+### POST /api/pvp/commit/{game_id}
+
+Submit a commit hash for your choice. Requires Authorization header.
+
+Request body:
+```json
+{ "commit": "<sha256 hex of game_id:choice:salt>" }
+```
+
+Response:
+```json
+{
+  "game_id": "<uuid>",
+  "status": "player1_committed" | "player2_committed" | "both_committed"
+}
+```
+
+### POST /api/pvp/reveal/{game_id}
+
+Reveal your choice and salt. Server verifies against your commit. If both players have revealed, the game resolves.
+
+Request body:
+```json
+{ "choice": "rock" | "paper" | "scissors", "salt": "<hex>" }
+```
+
+**If waiting for opponent reveal:**
+```json
+{
+  "game_id": "<uuid>",
+  "status": "player1_revealed" | "player2_revealed"
+}
+```
+
+**If both revealed (game resolved):**
+```json
+{
+  "game_id": "<uuid>",
+  "result": "win" | "lose" | "draw",
+  "your_choice": "rock",
+  "opponent_choice": "scissors",
+  "settlement": {
+    "winner_payout": "0.095",
+    "platform_fee": "0.005",
+    "reward_token": "<token_type | null>",
+    "reward_amount": 1
+  }
+}
+```
+
+On draw, the game automatically resets to the commit phase for a rematch (up to 10 rounds).
+
+### GET /api/pvp/game/{game_id}
+
+Poll game state. Optional Authorization header to see your player perspective.
+
+```json
+{
+  "game_id": "<uuid>",
+  "status": "waiting_for_opponent" | "both_paid" | "player1_committed" | "both_committed" | "resolved_player1_wins" | "settled" | ...,
+  "room_code": "ABC123",
+  "your_player": 1 | 2 | null,
+  "result": "win" | "lose" | "draw" | null,
+  "your_choice": "rock" | null,
+  "opponent_choice": "scissors" | null,
+  "rounds": [...],
+  "settlement": { ... } | null,
+  "created_at": "<rfc3339>"
+}
+```
+
+Opponent choice is only revealed after the game resolves.
+
+### GET /api/pvp/fairness/{game_id}
+
+Only available after game resolution. Verifies both players' commit-reveal integrity.
+
+```json
+{
+  "game_id": "<uuid>",
+  "total_rounds": 1,
+  "all_verified": true,
+  "rounds": [
+    {
+      "round": 1,
+      "player1_choice": "rock",
+      "player1_salt": "<hex>",
+      "player1_commit": "<sha256 hex>",
+      "player1_verified": true,
+      "player2_choice": "scissors",
+      "player2_salt": "<hex>",
+      "player2_commit": "<sha256 hex>",
+      "player2_verified": true
+    }
+  ]
+}
+```
 
 ### PvP Settlement
 
@@ -224,6 +432,14 @@ PvP mode allows two agents/players to compete against each other. Both players p
 | Draw    | refund both   | 5% (default) |
 
 Winner also earns 1 token matching their winning choice (same as PvE).
+
+### PvP Timeouts
+
+| Phase | Timeout | Result |
+|-------|---------|--------|
+| Payment | 60s | Game expired |
+| Commit | 30s | Non-committing player forfeits |
+| Reveal | 30s | Non-revealing player forfeits |
 
 ## Error Responses
 
