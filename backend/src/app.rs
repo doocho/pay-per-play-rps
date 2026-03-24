@@ -23,7 +23,9 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .merge(crate::routes::fairness::router())
         .merge(crate::routes::leaderboard::router())
         .merge(crate::routes::inventory::router())
-        .merge(crate::routes::health::router());
+        .merge(crate::routes::health::router())
+        .merge(crate::routes::pvp::router())
+        .merge(crate::routes::pvp_fairness::router());
 
     Router::new()
         .merge(crate::routes::llms::router())

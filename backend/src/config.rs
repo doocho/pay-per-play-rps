@@ -13,6 +13,13 @@ pub struct AppConfig {
     pub mpp_rpc_url: String,
     pub mpp_realm: String,
     pub port: u16,
+    // PvP config
+    pub pvp_price: Decimal,
+    pub pvp_currency: String,
+    pub pvp_platform_fee_bps: i32,
+    pub pvp_payment_timeout_seconds: u64,
+    pub pvp_commit_timeout_seconds: u64,
+    pub pvp_reveal_timeout_seconds: u64,
 }
 
 impl AppConfig {
@@ -28,11 +35,21 @@ impl AppConfig {
             mpp_rpc_url: env_or("MPP_RPC_URL", "https://rpc.moderato.tempo.xyz"),
             mpp_realm: env_or("MPP_REALM", "pay-per-play-rps"),
             port: env_or("PORT", "8080").parse()?,
+            pvp_price: Decimal::from_str(&env_or("PVP_PRICE", "0.05"))?,
+            pvp_currency: env_or("PVP_CURRENCY", "USD"),
+            pvp_platform_fee_bps: env_or("PVP_PLATFORM_FEE_BPS", "500").parse()?,
+            pvp_payment_timeout_seconds: env_or("PVP_PAYMENT_TIMEOUT_SECONDS", "60").parse()?,
+            pvp_commit_timeout_seconds: env_or("PVP_COMMIT_TIMEOUT_SECONDS", "30").parse()?,
+            pvp_reveal_timeout_seconds: env_or("PVP_REVEAL_TIMEOUT_SECONDS", "30").parse()?,
         })
     }
 
     pub fn play_price_str(&self) -> String {
         self.play_price.to_string()
+    }
+
+    pub fn pvp_price_str(&self) -> String {
+        self.pvp_price.to_string()
     }
 }
 

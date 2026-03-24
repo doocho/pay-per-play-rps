@@ -5,4 +5,6 @@ pub mod inventory;
 pub mod leaderboard;
 pub mod llms;
 pub mod play;
+pub mod pvp;
+pub mod pvp_fairness;
 pub mod receipts;

@@ -17,15 +17,46 @@ async fn get_leaderboard(
 ) -> Result<Json<Vec<LeaderboardEntry>>, AppError> {
     let entries = sqlx::query_as::<_, LeaderboardEntry>(
         r#"
+        WITH combined AS (
+            -- PvE games
+            SELECT
+                g.user_id,
+                CASE WHEN g.result = 'win' THEN 1 ELSE 0 END AS is_win,
+                CASE WHEN g.result = 'draw' THEN 1 ELSE 0 END AS is_draw,
+                CASE WHEN g.result = 'lose' THEN 1 ELSE 0 END AS is_loss
+            FROM games g
+            WHERE g.status = 'settled' AND g.user_id IS NOT NULL
+
+            UNION ALL
+
+            -- PvP games (player1 perspective)
+            SELECT
+                pg.player1_id AS user_id,
+                CASE WHEN pg.result = 'player1_wins' THEN 1 ELSE 0 END AS is_win,
+                CASE WHEN pg.result = 'draw' THEN 1 ELSE 0 END AS is_draw,
+                CASE WHEN pg.result = 'player2_wins' THEN 1 ELSE 0 END AS is_loss
+            FROM pvp_games pg
+            WHERE pg.status = 'settled' AND pg.player1_id IS NOT NULL
+
+            UNION ALL
+
+            -- PvP games (player2 perspective)
+            SELECT
+                pg.player2_id AS user_id,
+                CASE WHEN pg.result = 'player2_wins' THEN 1 ELSE 0 END AS is_win,
+                CASE WHEN pg.result = 'draw' THEN 1 ELSE 0 END AS is_draw,
+                CASE WHEN pg.result = 'player1_wins' THEN 1 ELSE 0 END AS is_loss
+            FROM pvp_games pg
+            WHERE pg.status = 'settled' AND pg.player2_id IS NOT NULL
+        )
         SELECT
             u.wallet_address,
             COUNT(*) AS total_games,
-            COUNT(*) FILTER (WHERE g.result = 'win') AS wins,
-            COUNT(*) FILTER (WHERE g.result = 'draw') AS draws,
-            COUNT(*) FILTER (WHERE g.result = 'lose') AS losses
-        FROM games g
-        JOIN users u ON u.id = g.user_id
-        WHERE g.status = 'settled'
+            SUM(c.is_win)::bigint AS wins,
+            SUM(c.is_draw)::bigint AS draws,
+            SUM(c.is_loss)::bigint AS losses
+        FROM combined c
+        JOIN users u ON u.id = c.user_id
         GROUP BY u.wallet_address
         ORDER BY wins DESC, total_games DESC
         LIMIT 50

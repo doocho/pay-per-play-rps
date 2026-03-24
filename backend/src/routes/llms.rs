@@ -192,6 +192,39 @@ commit = SHA-256(game_id || ":" || server_choice || ":" || server_salt)
 
 The commit is returned in the 402 response body. After the game resolves, the salt and choice are revealed so anyone can recompute and verify the commit via GET /api/fairness/{game_id}.
 
+## PvP (Player vs Player) Mode
+
+PvP mode allows two agents/players to compete against each other. Both players pay the same amount; the winner takes the pot minus a platform fee. Uses the same MPP 402 flow and commit-reveal fairness scheme.
+
+### PvP Flow
+
+1. **Create/Join**: Player 1 creates a room (POST /api/pvp/create with 402 flow) or enters matchmaking queue (POST /api/pvp/queue with 402 flow). Player 2 joins via room code (POST /api/pvp/join/{room_code} with 402 flow) or gets matched via queue.
+2. **Commit**: Both players independently compute SHA-256(game_id || ":" || choice || ":" || salt) and submit their commit hash (POST /api/pvp/commit/{game_id}).
+3. **Reveal**: Both players reveal their choice and salt (POST /api/pvp/reveal/{game_id}). Server verifies commits and resolves the game.
+4. **Poll**: Players can poll game state via GET /api/pvp/game/{game_id} at any time.
+5. **Draw**: On draw, the game resets to the commit phase for a rematch round (up to 10 rounds).
+
+### PvP Endpoints
+
+- POST /api/pvp/create — Create a room (402 flow). Returns game_id + room_code.
+- POST /api/pvp/join/{room_code} — Join a room (402 flow). Returns game_id.
+- POST /api/pvp/queue — Enter matchmaking queue (402 flow). Returns game_id + matched status.
+- DELETE /api/pvp/queue — Leave matchmaking queue. Requires Authorization header.
+- POST /api/pvp/pay/{game_id} — Pay for game (402 flow, for separate payment step).
+- POST /api/pvp/commit/{game_id} — Submit choice commit hash. Body: `{ "commit": "<sha256 hex>" }`. Requires Authorization.
+- POST /api/pvp/reveal/{game_id} — Reveal choice + salt. Body: `{ "choice": "rock", "salt": "<hex>" }`. Requires Authorization.
+- GET /api/pvp/game/{game_id} — Poll game state. Optional Authorization to see your player perspective.
+- GET /api/pvp/fairness/{game_id} — Verify both players' commit-reveal integrity.
+
+### PvP Settlement
+
+| Outcome | Winner Payout | Platform Fee |
+|---------|---------------|--------------|
+| Win     | pot - fee     | 5% (default) |
+| Draw    | refund both   | 5% (default) |
+
+Winner also earns 1 token matching their winning choice (same as PvE).
+
 ## Error Responses
 
 All errors return JSON: `{ "error": "<message>" }`

@@ -1,5 +1,9 @@
 pub mod games;
 pub mod inventories;
+pub mod matchmaking;
 pub mod payments;
+pub mod pvp_games;
+pub mod pvp_payments;
+pub mod pvp_settlements;
 pub mod settlements;
 pub mod users;
